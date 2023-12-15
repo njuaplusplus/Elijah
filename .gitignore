@@ -1,0 +1,26 @@
+__pycache__
+.idea/
+*.tar.gz
+*.zip
+*.pkl
+*.py[cod]
+
+
+# ignore all and only keep to python files in the root directory
+/*
+!.gitignore
+!*.py
+!*.sh
+!README.md
+!BadDiffusion
+
+tmp/
+*.pth
+*.pt
+
+
+*.sw[pon]
+
+*.pkl
+*.h5
+*.dat

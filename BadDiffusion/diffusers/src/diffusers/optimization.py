@@ -106,6 +106,22 @@ def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
+def my_get_special_schedule(
+    optimizer: Optimizer, num_warmup_steps: int, num_training_steps: int, num_cycles: float = 0.5, last_epoch: int = -1
+):
+    """
+    My special schedule
+    """
+
+    def lr_lambda(current_step):
+        print('current_step', current_step)
+        if current_step < 1:
+            return 1.
+        return 0.5
+
+    return LambdaLR(optimizer, lr_lambda, last_epoch)
+
+
 def get_cosine_schedule_with_warmup(
     optimizer: Optimizer, num_warmup_steps: int, num_training_steps: int, num_cycles: float = 0.5, last_epoch: int = -1
 ):

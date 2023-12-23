@@ -45,6 +45,8 @@ class DDPMPipeline(DiffusionPipeline):
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
         init: Optional[torch.Tensor] = None,
+        return_full_mov: bool = True,
+        return_first_mov: bool = True,
         **kwargs,
     ) -> Union[ImagePipelineOutput, Tuple]:
         r"""
@@ -86,7 +88,9 @@ class DDPMPipeline(DiffusionPipeline):
 
             # 2. compute previous image: x_t -> t_t-1
             image = self.scheduler.step(model_output, t, image, generator=generator).prev_sample
-            mov.append((image / 2 + 0.5).clamp(0, 1).cpu().permute(0, 2, 3, 1).numpy())
+
+            if return_full_mov or (return_first_mov and len(mov) == 0):
+                mov.append((image / 2 + 0.5).clamp(0, 1).cpu().permute(0, 2, 3, 1).numpy())
 
         image = (image / 2 + 0.5).clamp(0, 1)
         image = image.cpu().permute(0, 2, 3, 1).numpy()

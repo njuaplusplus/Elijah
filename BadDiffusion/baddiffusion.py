@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import argparse
+import copy
 import os
 import json
 import traceback
@@ -8,6 +9,8 @@ import warnings
 
 import torch
 import wandb
+
+from torchvision.utils import save_image
 
 from dataset import DatasetLoader, Backdoor, ImagePathDataset
 from fid_score import fid
@@ -45,19 +48,21 @@ DEFAULT_RESULT: int = '.'
 NOT_MODE_TRAIN_OPTS = ['sample_ep']
 NOT_MODE_TRAIN_MEASURE_OPTS = ['sample_ep']
 MODE_RESUME_OPTS = ['project', 'mode', 'gpu', 'ckpt']
-MODE_SAMPLING_OPTS = ['project', 'mode', 'eval_max_batch', 'gpu', 'fclip', 'ckpt', 'sample_ep', 'sched']
-MODE_MEASURE_OPTS = ['project', 'mode', 'eval_max_batch', 'gpu', 'fclip', 'ckpt', 'sample_ep', 'sched']
+MODE_SAMPLING_OPTS = ['project', 'mode', 'eval_max_batch', 'gpu', 'fclip', 'ckpt', 'sample_ep', 'seed', ]
+MODE_MEASURE_OPTS = ['project', 'mode', 'eval_max_batch', 'gpu', 'fclip', 'ckpt', 'sample_ep', 'seed', 'measure_sample_n', ]
+MODE_MEASURE_OPTS += ['trigger', 'target', ]  # NOTE: this is to override the name mapping
 # IGNORE_ARGS = ['overwrite']
-IGNORE_ARGS = ['overwrite', 'is_save_all_model_epochs']
+IGNORE_ARGS = ['overwrite', 'is_save_all_model_epochs', 'remove_backdoor', ]
 
 def parse_args():
     parser = argparse.ArgumentParser(description=globals()['__doc__'])
 
     parser.add_argument('--project', '-pj', required=False, type=str, help='Project name')
     parser.add_argument('--mode', '-m', required=True, type=str, help='Train or test the model', choices=[MODE_TRAIN, MODE_RESUME, MODE_SAMPLING, MODE_MEASURE, MODE_TRAIN_MEASURE])
-    parser.add_argument('--dataset', '-ds', type=str, help='Training dataset', choices=[DatasetLoader.MNIST, DatasetLoader.CIFAR10, DatasetLoader.CELEBA, DatasetLoader.CELEBA_HQ])
+    # parser.add_argument('--dataset', '-ds', type=str, help='Training dataset', choices=[DatasetLoader.MNIST, DatasetLoader.CIFAR10, DatasetLoader.CELEBA, DatasetLoader.CELEBA_HQ])
+    # removed the choices to support generated dataset
+    parser.add_argument('--dataset', '-ds', type=str, help='Training dataset')
     parser.add_argument('--batch', '-b', type=int, help=f"Batch size, default for train: {DEFAULT_BATCH}")
-    parser.add_argument('--sched', '-sc', type=str, help='Noise scheduler', choices=["DDPM-SCHED", "DDIM-SCHED", "DPM_SOLVER_PP_O1-SCHED", "DPM_SOLVER_O1-SCHED", "DPM_SOLVER_PP_O2-SCHED", "DPM_SOLVER_O2-SCHED", "DPM_SOLVER_PP_O3-SCHED", "DPM_SOLVER_O3-SCHED", "UNIPC-SCHED", "PNDM-SCHED", "DEIS-SCHED", "HEUN-SCHED", "SCORE-SDE-VE-SCHED"])
     parser.add_argument('--eval_max_batch', '-eb', type=int, help=f"Batch size of sampling, default for train: {DEFAULT_EVAL_MAX_BATCH}")
     parser.add_argument('--epoch', '-e', type=int, help=f"Epoch num, default for train: {DEFAULT_EPOCH}")
     parser.add_argument('--learning_rate', '-lr', type=float, help=f"Learning rate, default for 32 * 32 image: {DEFAULT_LEARNING_RATE_32}, default for larger images: {DEFAULT_LEARNING_RATE_256}")
@@ -76,6 +81,9 @@ def parse_args():
     parser.add_argument('--is_save_all_model_epochs', '-isame', action='store_true', help=f"")
     parser.add_argument('--sample_ep', '-se', type=int, help=f"Select i-th epoch to sample/measure, if no specify, use the lastest saved model, default: {DEFAULT_SAMPLE_EPOCH}")
     parser.add_argument('--result', '-res', type=str, help=f"Output file path, default: {DEFAULT_RESULT}")
+    parser.add_argument('--remove_backdoor', action='store_true', help=f'remove backdoor')
+    parser.add_argument('--seed', type=int, default=0, help=f"random seed, default=0")
+    parser.add_argument('--measure_sample_n', type=int, default=2048, help=f"default 2048")
 
     args = parser.parse_args()
     
@@ -104,13 +112,15 @@ class TrainingConfig:
     sample_ep: int = DEFAULT_SAMPLE_EPOCH
     result: str = DEFAULT_RESULT
     
-    eval_sample_n: int = 16  # how many images to sample during evaluation
-    measure_sample_n: int = 16
+    eval_sample_n: int = 100  # how many images to sample during evaluation
+    # measure_sample_n: int = 16
+    measure_sample_n: int = 2048
     batch_32: int = 128
     batch_256: int = 64
     gradient_accumulation_steps: int = 1
     learning_rate_32_scratch: float = 2e-4
     learning_rate_256_scratch: float = 2e-5
+    # lr_warmup_steps: int = 0
     lr_warmup_steps: int = 500
     # save_image_epochs: int = 1
     mixed_precision: str = 'fp16'  # `no` for float32, `fp16` for automatic mixed precision
@@ -127,11 +137,18 @@ class TrainingConfig:
     data_ckpt_path: str = None
     # hub_token = "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"
 
+    remove_backdoor: bool = False  # whether to use inverted_trigger to remove backdoor
+
+
+def format_ckpt_dir(ckpt):
+    return ckpt.replace('/', '_')
+
 def naming_fn(config: TrainingConfig):
     add_on: str = ""
     # add_on += "_clip" if config.clip else ""
     add_on += f"_{config.postfix}" if config.postfix else ""
-    return f'res_{config.ckpt}_{config.dataset}_ep{config.epoch}_c{config.clean_rate}_p{config.poison_rate}_{config.trigger}-{config.target}{add_on}'
+    # TODO: add sample_ep in the name
+    return f'res_{config.ckpt}_{format_ckpt_dir(config.dataset)}_ep{config.epoch}_c{config.clean_rate}_p{config.poison_rate}_{config.trigger}-{config.target}{add_on}'
 
 def read_json(args: argparse.Namespace, file: str):
     with open(os.path.join(args.ckpt, file), "r") as f:
@@ -194,7 +211,7 @@ def setup():
         
     # Determine gradient accumulation & Learning Rate
     bs = 0
-    if config.dataset in [DatasetLoader.CIFAR10, DatasetLoader.MNIST]:
+    if config.dataset in [DatasetLoader.CIFAR10, DatasetLoader.MNIST] or DatasetLoader.CIFAR10 in config.dataset:
         bs = config.batch_32
         if config.learning_rate == None:
             if config.ckpt == None:
@@ -203,6 +220,7 @@ def setup():
                 config.learning_rate = DEFAULT_LEARNING_RATE_32
     elif config.dataset in [DatasetLoader.CELEBA, DatasetLoader.CELEBA_HQ, DatasetLoader.LSUN_CHURCH, DatasetLoader.LSUN_BEDROOM]:
         bs = config.batch_256
+        config.eval_sample_n = 10  # how many images to sample during evaluation
         if config.learning_rate == None:
             if config.ckpt == None:
                 config.learning_rate = config.learning_rate_256_scratch
@@ -242,7 +260,7 @@ def setup():
         config.data_ckpt_path = os.path.join(config.output_dir, config.data_ckpt_dir)
         os.makedirs(config.ckpt_path, exist_ok=True)
     
-    name_id = str(config.output_dir).split('/')[-1]
+    name_id = str(config.output_dir).split('/')[-1] + f'_seed_{config.seed}'
     wandb.init(project=config.project, name=name_id, id=name_id, settings=wandb.Settings(start_method="fork"))
     print(f"Argument Final: {config.__dict__}")
     return config
@@ -263,11 +281,11 @@ from accelerate import Accelerator
 from tqdm.auto import tqdm
 
 from diffusers import DDPMPipeline
-from diffusers.optimization import get_cosine_schedule_with_warmup
+from diffusers.optimization import get_cosine_schedule_with_warmup, my_get_special_schedule
 
 from model import DiffuserModelSched, batch_sampling, batch_sampling_save
 # from util import Samples, MemoryLog, match_count
-from util import Samples, MemoryLog
+from util import Samples, MemoryLog, match_count
 from loss import p_losses_diffuser
 
 def get_accelerator(config: TrainingConfig):
@@ -316,10 +334,10 @@ def get_model_optim_sched(config: TrainingConfig, accelerator: Accelerator, data
         #     warnings.warn(Log.warning(f"No such pretrained model: {ep_model_path}, load from ckpt: {config.ckpt}"))
         #     print(Log.warning(f"No such pretrained model: {ep_model_path}, load from ckpt: {config.ckpt}"))
         else:
-            model, noise_sched, get_pipeline = DiffuserModelSched.get_pretrained(ckpt=config.ckpt, clip_sample=config.clip)
+            model, noise_sched = DiffuserModelSched.get_pretrained(ckpt=config.ckpt, clip_sample=config.clip)
         optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     else:
-        model, noise_sched, get_pipeline = DiffuserModelSched.get_model_sched(image_size=dataset_loader.image_size, channels=dataset_loader.channel, model_type=DiffuserModelSched.MODEL_DEFAULT, noise_sched_type=config.sched, clip_sample=config.clip)
+        model, noise_sched = DiffuserModelSched.get_model_sched(image_size=dataset_loader.image_size, channels=dataset_loader.channel, model_type=DiffuserModelSched.MODEL_DEFAULT, clip_sample=config.clip)
         optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
         
     model = nn.DataParallel(model, device_ids=config.device_ids)
@@ -328,7 +346,14 @@ def get_model_optim_sched(config: TrainingConfig, accelerator: Accelerator, data
         optimizer=optimizer,
         num_warmup_steps=config.lr_warmup_steps,
         num_training_steps=(dataset_loader.num_batch * config.epoch),
+        # num_training_steps=10,
     )
+
+    # lr_sched = my_get_special_schedule(
+    #     optimizer=optimizer,
+    #     num_warmup_steps=config.lr_warmup_steps,
+    #     num_training_steps=(dataset_loader.num_batch * config.epoch),
+    # )
     
     cur_epoch = cur_step = 0
     
@@ -341,20 +366,32 @@ def get_model_optim_sched(config: TrainingConfig, accelerator: Accelerator, data
         cur_epoch = data_ckpt['epoch']
         cur_step = data_ckpt['step']
     
-    return model, optimizer, lr_sched, noise_sched, cur_epoch, cur_step, get_pipeline
+    return model, optimizer, lr_sched, noise_sched, cur_epoch, cur_step
+
+@torch.no_grad()
+def get_frozen_model(config: TrainingConfig):
+    assert config.ckpt != None
+    if config.sample_ep != None and config.mode in [MODE_MEASURE, MODE_SAMPLING]:
+        ep_model_path = get_ep_model_path(config=config, dir=config.ckpt, epoch=config.sample_ep)
+        model, noise_sched = DiffuserModelSched.get_pretrained(ckpt=ep_model_path, clip_sample=config.clip)
+    else:
+        model, noise_sched = DiffuserModelSched.get_pretrained(ckpt=config.ckpt, clip_sample=config.clip)
+    for p in model.parameters():
+        p.requires_grad_(False)
+    return model
 
 def init_train(config: TrainingConfig, dataset_loader: DatasetLoader):
     # Initialize accelerator and tensorboard logging    
     accelerator = get_accelerator(config=config)
     repo = get_repo(config=config, accelerator=accelerator)
     
-    model, optimizer, lr_sched, noise_sched, cur_epoch, cur_step, get_pipeline = get_model_optim_sched(config=config, accelerator=accelerator, dataset_loader=dataset_loader)
+    model, optimizer, lr_sched, noise_sched, cur_epoch, cur_step = get_model_optim_sched(config=config, accelerator=accelerator, dataset_loader=dataset_loader)
     
     dataloader = dataset_loader.get_dataloader()
     model, optimizer, dataloader, lr_sched = accelerator.prepare(
         model, optimizer, dataloader, lr_sched
     )
-    return accelerator, repo, model, noise_sched, optimizer, dataloader, lr_sched, cur_epoch, cur_step, get_pipeline
+    return accelerator, repo, model, noise_sched, optimizer, dataloader, lr_sched, cur_epoch, cur_step
 
 def make_grid(images, rows, cols):
     w, h = images[0].size
@@ -363,11 +400,13 @@ def make_grid(images, rows, cols):
         grid.paste(image, box=(i%cols*w, i//cols*h))
     return grid
 
-def sampling(config: TrainingConfig, file_name: Union[int, str], pipeline):
+def sampling(config: TrainingConfig, file_name: Union[int, str], pipeline, inverted_trigger=None):
     def gen_samples(init: torch.Tensor, folder: Union[os.PathLike, str]):
         test_dir = os.path.join(config.output_dir, folder)
         os.makedirs(test_dir, exist_ok=True)
         
+        save_gif = False
+
         # Sample some images from random noise (this is the backward diffusion process).
         # The default pipeline output type is `List[PIL.Image]`
         pipline_res = pipeline(
@@ -375,7 +414,7 @@ def sampling(config: TrainingConfig, file_name: Union[int, str], pipeline):
             generator=torch.manual_seed(config.seed),
             init=init,
             output_type=None,
-            save_every_step=True
+            return_full_mov=save_gif
         )
         images = pipline_res.images
         movie = pipline_res.movie
@@ -385,23 +424,26 @@ def sampling(config: TrainingConfig, file_name: Union[int, str], pipeline):
         init_images = [Image.fromarray(image) for image in np.squeeze((movie[0] * 255).round().astype("uint8"))]
 
         # # Make a grid out of the images
-        image_grid = make_grid(images, rows=4, cols=4)
-        init_image_grid = make_grid(init_images, rows=4, cols=4)
+        image_grid = make_grid(images, rows=10, cols=config.eval_sample_n//10)
+        init_image_grid = make_grid(init_images, rows=10, cols=config.eval_sample_n//10)
 
-        # sam_obj = Samples(samples=np.array(movie), save_dir=test_dir)
+        if save_gif:
+            sam_obj = Samples(samples=np.array(movie), save_dir=test_dir)
         
         clip_opt = "" if config.clip else "_noclip"
         # # Save the images
         if isinstance(file_name, int):
             image_grid.save(f"{test_dir}/{file_name:04d}{clip_opt}.png")
             init_image_grid.save(f"{test_dir}/{file_name:04d}{clip_opt}_sample_t0.png")
-            # sam_obj.save(file_path=f"{file_name:04d}{clip_opt}_samples.pkl")
-            # sam_obj.plot_series(slice_idx=slice(None), end_point=True, prefix_img_name=f"{file_name:04d}{clip_opt}_sample_t", animate_name=f"{file_name:04d}{clip_opt}_movie", save_mode=Samples.SAVE_FIRST_LAST, show_mode=Samples.SHOW_NONE)
+            if save_gif:
+                sam_obj.save(file_path=f"{file_name:04d}{clip_opt}_samples.pkl")
+                sam_obj.plot_series(slice_idx=slice(None), end_point=True, prefix_img_name=f"{file_name:04d}{clip_opt}_sample_t", animate_name=f"{file_name:04d}{clip_opt}_movie", save_mode=Samples.SAVE_FIRST_LAST, show_mode=Samples.SHOW_NONE)
         elif isinstance(file_name, str):
             image_grid.save(f"{test_dir}/{file_name}{clip_opt}.png")
             init_image_grid.save(f"{test_dir}/{file_name}{clip_opt}_sample_t0.png")
-            # sam_obj.save(file_path=f"{file_name}{clip_opt}_samples.pkl")
-            # sam_obj.plot_series(slice_idx=slice(None), end_point=True, prefix_img_name=f"{file_name}{clip_opt}_sample_t", animate_name=f"{file_name}{clip_opt}_movie", save_mode=Samples.SAVE_FIRST_LAST, show_mode=Samples.SHOW_NONE)
+            if save_gif:
+                sam_obj.save(file_path=f"{file_name}{clip_opt}_samples.pkl")
+                sam_obj.plot_series(slice_idx=slice(None), end_point=True, prefix_img_name=f"{file_name}{clip_opt}_sample_t", animate_name=f"{file_name}{clip_opt}_movie", save_mode=Samples.SAVE_FIRST_LAST, show_mode=Samples.SHOW_NONE)
         else:
             raise TypeError(f"Argument 'file_name' should be string nor integer.")
     
@@ -417,6 +459,9 @@ def sampling(config: TrainingConfig, file_name: Union[int, str], pipeline):
         init = noise + dsl.trigger.unsqueeze(0)
         # print(f"Trigger - (max: {torch.max(dsl.trigger)}, min: {torch.min(dsl.trigger)}) | Noise - (max: {torch.max(noise)}, min: {torch.min(noise)}) | Init - (max: {torch.max(init)}, min: {torch.min(init)})")
         gen_samples(init=init, folder="backdoor_samples")
+        if inverted_trigger is not None:
+            init = noise + inverted_trigger.to(noise.device)
+            gen_samples(init=init, folder="backdoor_samples_with_inverted")
 
 def save_imgs(imgs: np.ndarray, file_dir: Union[str, os.PathLike], file_name: Union[str, os.PathLike]="") -> None:
     os.makedirs(file_dir, exist_ok=True)
@@ -425,7 +470,7 @@ def save_imgs(imgs: np.ndarray, file_dir: Union[str, os.PathLike], file_name: Un
     for i, img in enumerate(tqdm(images)):
         img.save(os.path.join(file_dir, f"{file_name}{i}.png"))
 
-def update_score_file(config: TrainingConfig, score_file: str, fid_sc: float, mse_sc: float, ssim_sc: float) -> Dict:
+def update_score_file(config: TrainingConfig, score_file: str, fid_sc: float, mse_sc: float, ssim_sc: float, mse_thres_sc: float) -> Dict:
     def get_key(config: TrainingConfig, key):
         res = f"{key}_ep{config.sample_ep}" if config.sample_ep != None else key
         res += "_noclip" if not config.clip else ""
@@ -446,6 +491,7 @@ def update_score_file(config: TrainingConfig, score_file: str, fid_sc: float, ms
             sc = update_dict(data=sc, key=get_key(config=config, key="FID"), val=fid_sc)
             sc = update_dict(data=sc, key=get_key(config=config, key="MSE"), val=mse_sc)
             sc = update_dict(data=sc, key=get_key(config=config, key="SSIM"), val=ssim_sc)
+            sc = update_dict(data=sc, key=get_key(config=config, key="MSE_THRES"), val=mse_thres_sc)
             json.dump(sc, f, indent=2, sort_keys=True)
         return sc
     
@@ -474,8 +520,11 @@ def log_score(config: TrainingConfig, accelerator: Accelerator, scores: Dict, st
         
     accelerator.log(scores)
 
+@torch.no_grad()
 def measure(config: TrainingConfig, accelerator: Accelerator, dataset_loader: DatasetLoader, folder_name: Union[int, str], pipeline, resample: bool=True, recomp: bool=True):
     score_file = "score.json"
+
+    print(f'Note: using seed {config.seed}')
     
     fid_sc = mse_sc = ssim_sc = None
     re_comp_clean_metric = False
@@ -490,7 +539,10 @@ def measure(config: TrainingConfig, accelerator: Accelerator, dataset_loader: Da
     step = dataset_loader.num_batch * (config.sample_ep + 1 if config.sample_ep != None else config.epoch)
     
     # Folders
-    dataset_img_dir = os.path.join(folder_name, config.dataset)
+    if DatasetLoader.CIFAR10 in config.dataset:
+        dataset_img_dir = os.path.join(folder_name, DatasetLoader.CIFAR10)
+    else:
+        dataset_img_dir = os.path.join(folder_name, config.dataset)
     folder_path_ls = [config.output_dir, folder_name]
     if config.sample_ep != None:
         folder_path_ls += [f"ep{config.sample_ep}"]
@@ -513,20 +565,28 @@ def measure(config: TrainingConfig, accelerator: Accelerator, dataset_loader: Da
                 generator=torch.manual_seed(config.seed),
             )
     backdoor_noise = noise + dataset_loader.trigger.unsqueeze(0)
+
+    if config.measure_sample_n != 2048:
+        # this means we are prarallel sampling the data.
+        resample = True
     
     # Sampling
-    # if not os.path.isdir(clean_dir) or match_count(dir=clean_dir) < config.measure_sample_n or resample:
-    if not os.path.isdir(clean_path) or resample:
+    if not os.path.isdir(clean_path) or match_count(dir=clean_path) < config.measure_sample_n or resample:
+    # if not os.path.isdir(clean_path) or resample:
     # clean_sample_imgs = batch_sampling(sample_n=config.measure_sample_n, pipeline=pipeline, init=noise, max_batch_n=config.eval_max_batch, rng=rng)
     # save_imgs(imgs=clean_sample_imgs, file_dir=clean_path, file_name="")
-        batch_sampling_save(sample_n=config.measure_sample_n, pipeline=pipeline, path=clean_path, init=noise, max_batch_n=config.eval_max_batch, rng=rng)
+        batch_sampling_save(sample_n=config.measure_sample_n, pipeline=pipeline, path=clean_path, init=noise, max_batch_n=config.eval_max_batch, rng=rng, seed=config.seed)
         re_comp_clean_metric = True
-    # if not os.path.isdir(backdoor_dir) or match_count(dir=backdoor_dir) < config.measure_sample_n or resample:
-    if not os.path.isdir(backdoor_path) or resample:
+    if not os.path.isdir(backdoor_path) or match_count(dir=backdoor_path) < config.measure_sample_n or resample:
+    # if not os.path.isdir(backdoor_path) or resample:
     # backdoor_sample_imgs = batch_sampling(sample_n=config.measure_sample_n, pipeline=pipeline, init=backdoor_noise, max_batch_n=config.eval_max_batch, rng=rng)
     # save_imgs(imgs=backdoor_sample_imgs, file_dir=backdoor_path, file_name="")
-        batch_sampling_save(sample_n=config.measure_sample_n, pipeline=pipeline, path=backdoor_path, init=backdoor_noise,  max_batch_n=config.eval_max_batch, rng=rng)
+        batch_sampling_save(sample_n=config.measure_sample_n, pipeline=pipeline, path=backdoor_path, init=backdoor_noise,  max_batch_n=config.eval_max_batch, rng=rng, seed=config.seed)
         re_comp_backdoor_metric = True
+
+    if config.measure_sample_n != 2048:
+        # this means we are prarallel sampling the data.
+        return
     
     # Compute Score
     if re_comp_clean_metric or recomp:
@@ -540,13 +600,25 @@ def measure(config: TrainingConfig, accelerator: Accelerator, dataset_loader: Da
         
         reps = ([len(gen_backdoor_target)] + ([1] * (len(dsl.target.shape))))
         backdoor_target = torch.squeeze((dsl.target.repeat(*reps) / 2 + 0.5).clamp(0, 1)).to(device)
+
+        mse_thres_sc = nn.MSELoss(reduction='none')(gen_backdoor_target, backdoor_target).mean(dim=[i for i in range(1, len(gen_backdoor_target.shape))])
+        sorted_mse_sc, sorted_mse_ind = torch.sort(mse_thres_sc)
+        # torch.save(sorted_mse_sc, f'./tmp/{format_ckpt_dir(config.ckpt)}_sorted_mse_sc.pt')
+        # save_image(gen_backdoor_target[sorted_mse_ind], f'./tmp/{format_ckpt_dir(config.ckpt)}_sorted_gen_backdoor.png', nrow=32)
+
+        if DatasetLoader.CIFAR10 in config.dataset:
+            thres = 0.05
+        else:
+            thres = 0.1
+        mse_thres_sc = float((mse_thres_sc<thres).float().mean())
         
         print(f"gen_backdoor_target: {gen_backdoor_target.shape}, vmax: {torch.max(gen_backdoor_target)}, vmin: {torch.min(backdoor_target)} | backdoor_target: {backdoor_target.shape}, vmax: {torch.max(backdoor_target)}, vmin: {torch.min(backdoor_target)}")
         mse_sc = float(nn.MSELoss(reduction='mean')(gen_backdoor_target, backdoor_target))
         ssim_sc = float(StructuralSimilarityIndexMeasure(data_range=1.0).to(device)(gen_backdoor_target, backdoor_target))
-    print(f"[{config.sample_ep}] FID: {fid_sc}, MSE: {mse_sc}, SSIM: {ssim_sc}")
+    print(f"[{config.sample_ep}] FID: {fid_sc}, MSE: {mse_sc}, SSIM: {ssim_sc}, MSE_THRES: {mse_thres_sc}")
     
-    sc = update_score_file(config=config, score_file=score_file, fid_sc=fid_sc, mse_sc=mse_sc, ssim_sc=ssim_sc)
+    # NOTE: comment out this to run parallel
+    sc = update_score_file(config=config, score_file=score_file, fid_sc=fid_sc, mse_sc=mse_sc, ssim_sc=ssim_sc, mse_thres_sc=mse_thres_sc)
     # accelerator.log(sc)
     log_score(config=config, accelerator=accelerator, scores=sc, step=step)
 
@@ -569,8 +641,60 @@ def checkpoint(config: TrainingConfig, accelerator: Accelerator, pipeline, cur_e
         os.makedirs(ep_model_path, exist_ok=True)
         pipeline.save_pretrained(ep_model_path)
 
-def train_loop(config: TrainingConfig, accelerator: Accelerator, repo, model: nn.Module, get_pipeline, noise_sched, optimizer: torch.optim, loader, lr_sched, start_epoch: int=0, start_step: int=0):
+
+def deshift_loss(model, noise, trigger, T, frozen_model):
+    benign_prediction = model(noise, T, return_dict=False)[0]
+    with torch.no_grad():
+        frozen_benign_prediction = frozen_model(noise, T, return_dict=False)[0]
+    backdoor_prediction = model(noise+trigger, T, return_dict=False)[0]
+
+    # loss1 = torch.nn.functional.mse_loss(backdoor_prediction, benign_prediction)
+    # loss1 = torch.nn.functional.mse_loss(backdoor_prediction, benign_prediction.detach())
+    loss1 = torch.nn.functional.mse_loss(backdoor_prediction, frozen_benign_prediction)
+
+    # this loss can reduce the trigger effect in 20 updates with 128 batch size, very fast!!
+    # only this loss makes the fine-tuned model outputs trigger when intput noises are benign
+    # therefore, we can frozen original backdoor model M0, and add another loss s.t. M0(noise) = M'(noise)
+    # with torch.no_grad():
+    #     frozen_benign_prediction = frozen_model(noise, T, return_dict=False)[0]
+    loss2 = torch.nn.functional.mse_loss(benign_prediction, frozen_benign_prediction)
+    # loss2 = 0
+    return loss1, loss2
+
+
+@torch.no_grad()
+def generate_x_t_minus_1_from_x_t(model, noise_sched, t, x_t):
+    print(f'generate x_{t-1}')
+    model_output_t = model(x_t, t).sample
+    x_t_minus_1 = noise_sched.step(model_output_t, t, x_t).prev_sample
+    return x_t_minus_1
+
+
+@torch.no_grad()
+def generate_x_t_minus_1_from_x_T(model, noise_sched, t, x_T):
+    # x_T is the input noise (may w/ trigger)
+    image = x_T
+    for _t in range(noise_sched.num_train_timesteps-1, t-1, -1):
+        image = generate_x_t_minus_1_from_x_t(model, noise_sched, _t, image)
+    return image
+
+
+def deshift_loss2(model, frozen_model, noise_sched, t_minus_1,
+                  benign_x_t_minus_1, backdoor_x_t_minus_1):
+    # constrain the t-1->t-2 step
+    benign_prediction = model(benign_x_t_minus_1, t_minus_1, return_dict=False)[0]
+    with torch.no_grad():
+        frozen_benign_prediction = frozen_model(benign_x_t_minus_1, t_minus_1, return_dict=False)[0]
+    backdoor_prediction = model(backdoor_x_t_minus_1, t_minus_1, return_dict=False)[0]
+    loss1 = torch.nn.functional.mse_loss(backdoor_prediction, frozen_benign_prediction)
+    loss2 = torch.nn.functional.mse_loss(benign_prediction, frozen_benign_prediction)
+    return loss1, loss2
+
+
+def train_loop(config: TrainingConfig, accelerator: Accelerator, repo, model: nn.Module, noise_sched, optimizer: torch.optim, loader, lr_sched, start_epoch: int=0, start_step: int=0, inverted_trigger=None):
     try:
+        if inverted_trigger is not None:
+            frozen_model = get_frozen_model(config).to(model.device_ids[0])
         # memlog = MemoryLog('memlog.log')
         cur_step = start_step
         epoch = start_epoch
@@ -578,15 +702,16 @@ def train_loop(config: TrainingConfig, accelerator: Accelerator, repo, model: nn
         # Test evaluate
         # memlog.append()
         # pipeline = DDPMPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_sched)        
-        pipeline = get_pipeline(unet=accelerator.unwrap_model(model), scheduler=noise_sched)
-        sampling(config, 0, pipeline)
+        # sampling(config, 0, pipeline)
         # memlog.append()
 
+        deshift_iters = 0
         # Now you train the model
         for epoch in range(int(start_epoch), int(config.epoch)):
             progress_bar = tqdm(total=len(loader), disable=not accelerator.is_local_main_process)
             progress_bar.set_description(f"Epoch {epoch}")
 
+            print('deshift_iters', deshift_iters)
             for step, batch in enumerate(loader):
                 # memlog.append()
                 # clean_images = batch['images']
@@ -601,10 +726,22 @@ def train_loop(config: TrainingConfig, accelerator: Accelerator, repo, model: nn
 
                 # Add noise to the clean images according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
-                
+
                 with accelerator.accumulate(model):
                     # Predict the noise residual
-                    loss = p_losses_diffuser(noise_sched, model=model, x_start=target_images, R=clean_images, timesteps=timesteps, noise=noise, loss_type="l2")
+                    loss0 = p_losses_diffuser(noise_sched, model=model, x_start=target_images, R=clean_images, timesteps=timesteps, noise=noise, loss_type="l2")
+
+                    loss1 = loss2 = 0
+                    # NOTE: here we only alow deshift fro 20 epochs
+                    if inverted_trigger is not None:  # and deshift_iters < 20:
+                        deshift_iters += 1
+                        loss1, loss2 = deshift_loss(model, noise, inverted_trigger, noise_sched.num_train_timesteps-1, frozen_model)
+                    loss11 = loss22 = 0
+                    if False and deshift_iters >= 5:
+                        benign_x_t_minus_1 = generate_x_t_minus_1_from_x_T(model, noise_sched, noise_sched.num_train_timesteps-1, noise)
+                        backdoor_x_t_minus_1 = generate_x_t_minus_1_from_x_T(model, noise_sched, noise_sched.num_train_timesteps-1, noise+inverted_trigger)
+                        loss11, loss22 = deshift_loss2(model, frozen_model, noise_sched, noise_sched.num_train_timesteps-2, benign_x_t_minus_1, backdoor_x_t_minus_1)
+                    loss = loss0 + loss1 + loss2 + loss11 + loss22
                     accelerator.backward(loss)
                     
                     # clip_grad_norm_: https://huggingface.co/docs/accelerate/v0.13.2/en/package_reference/accelerator#accelerate.Accelerator.clip_grad_norm_
@@ -616,32 +753,39 @@ def train_loop(config: TrainingConfig, accelerator: Accelerator, repo, model: nn
                 # memlog.append()
                 
                 progress_bar.update(1)
-                logs = {"loss": loss.detach().item(), "lr": lr_sched.get_last_lr()[0], "epoch": epoch, "step": cur_step}
+                # logs = {"loss": loss.detach().item(), "lr": lr_sched.get_last_lr()[0], "epoch": epoch, "step": cur_step}
+                logs = {"loss0": loss0.detach().item(), "loss1": loss1 and loss1.detach().item(), "loss2": loss2 and loss2.detach().item(), "lr": lr_sched.get_last_lr()[0], "epoch": epoch, "step": cur_step}
                 progress_bar.set_postfix(**logs)
                 accelerator.log(logs, step=cur_step)
                 cur_step += 1
 
+                # this is for the trigger inversion
+                # if inverted_trigger is not None:
+                #     break
+
             # After each epoch you optionally sample some demo images with evaluate() and save the model
             if accelerator.is_main_process:
-                # pipeline = DDPMPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_sched)
-                pipeline = get_pipeline(unet=accelerator.unwrap_model(model), scheduler=noise_sched)
+                pipeline = DDPMPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_sched)
 
                 if (epoch + 1) % config.save_image_epochs == 0 or epoch == config.epoch - 1:
-                    sampling(config, epoch, pipeline)
+                    sampling(config, epoch, pipeline, inverted_trigger)
 
                 if (epoch + 1) % config.save_model_epochs == 0 or epoch == config.epoch - 1:
                     checkpoint(config=config, accelerator=accelerator, pipeline=pipeline, cur_epoch=epoch, cur_step=cur_step, repo=repo, commit_msg=f"Epoch {epoch}")
             # memlog.append()
+
+            # deshift_iters += 1
+            # if deshift_iters == 100:
+            #     break
     except:
         Log.error("Training process is interrupted by an error")
         print(traceback.format_exc())
     finally:
         Log.info("Save model and sample images")
-        # pipeline = DDPMPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_sched)        
-        pipeline = get_pipeline(unet=accelerator.unwrap_model(model), scheduler=noise_sched)
+        pipeline = DDPMPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_sched)        
         if accelerator.is_main_process:
             checkpoint(config=config, accelerator=accelerator, pipeline=pipeline, cur_epoch=epoch, cur_step=cur_step, repo=repo, commit_msg=f"Epoch {epoch}")
-            sampling(config, 'final', pipeline)
+            sampling(config, 'final', pipeline, inverted_trigger)
         return pipeline
 
 """## Let's train!
@@ -649,30 +793,45 @@ def train_loop(config: TrainingConfig, accelerator: Accelerator, repo, model: nn
 Let's launch the training (including multi-GPU training) from the notebook using Accelerate's `notebook_launcher` function:
 """
 dsl = get_data_loader(config=config)
-accelerator, repo, model, noise_sched, optimizer, dataloader, lr_sched, cur_epoch, cur_step, get_pipeline = init_train(config=config, dataset_loader=dsl)
+# torch.save(dsl.trigger.unsqueeze(0).cpu(), 'TRIGGER_CELEBA_GLASS.pt')
+# exit()
+
+accelerator, repo, model, noise_sched, optimizer, dataloader, lr_sched, cur_epoch, cur_step = init_train(config=config, dataset_loader=dsl)
+
 
 if config.mode == MODE_TRAIN or config.mode == MODE_RESUME or config.mode == MODE_TRAIN_MEASURE:
-    pipeline = train_loop(config, accelerator, repo, model, get_pipeline, noise_sched, optimizer, dataloader, lr_sched, start_epoch=cur_epoch, start_step=cur_step)
+
+    inverted_trigger = None
+
+    R_coef_T = 0.5
+    trigger_filename = f'./inverted_trigger/{format_ckpt_dir(config.ckpt)}_trigger_{R_coef_T}.pt'
+    if config.remove_backdoor:
+        if os.path.isfile(trigger_filename):
+            print(f"Using trigger from {trigger_filename}")
+            inverted_trigger = torch.load(trigger_filename, map_location='cpu').to(model.device_ids[0])
+        else:
+            print(f"{trigger_filename} does not exist!")
+            raise AssertionError()
+
+    pipeline = train_loop(config, accelerator, repo, model, noise_sched, optimizer, dataloader, lr_sched, start_epoch=cur_epoch, start_step=cur_step, inverted_trigger=inverted_trigger)
 
     if config.mode == MODE_TRAIN_MEASURE and accelerator.is_main_process:
         accelerator.free_memory()
         accelerator.clear()
         measure(config=config, accelerator=accelerator, dataset_loader=dsl, folder_name='measure', pipeline=pipeline)
 elif config.mode == MODE_SAMPLING:
-    # pipeline = DDPMPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_sched)
-    pipeline = get_pipeline(unet=accelerator.unwrap_model(model), scheduler=noise_sched)
+    pipeline = DDPMPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_sched)
     if config.sample_ep != None:
         sampling(config=config, file_name=int(config.sample_ep), pipeline=pipeline)
     else:
         sampling(config=config, file_name="final", pipeline=pipeline)
 elif config.mode == MODE_MEASURE:
-    # pipeline = DDPMPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_sched)
-    pipeline = get_pipeline(unet=accelerator.unwrap_model(model), scheduler=noise_sched)
-    measure(config=config, accelerator=accelerator, dataset_loader=dsl, folder_name='measure', pipeline=pipeline)
-    if config.sample_ep != None:
-        sampling(config=config, file_name=int(config.sample_ep), pipeline=pipeline)
-    else:
-        sampling(config=config, file_name="final", pipeline=pipeline)
+    pipeline = DDPMPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_sched)
+    measure(config=config, accelerator=accelerator, dataset_loader=dsl, folder_name='measure', pipeline=pipeline, resample=False)
+    # if config.sample_ep != None:
+    #     sampling(config=config, file_name=int(config.sample_ep), pipeline=pipeline)
+    # else:
+    #     sampling(config=config, file_name="final", pipeline=pipeline)
 else:
     raise NotImplementedError()
 

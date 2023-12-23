@@ -88,6 +88,9 @@ class DatasetLoader(object):
         elif name == DatasetLoader.CELEBA_HQ:
             # return load_dataset("huggan/CelebA-HQ", split=split_method)
             return load_dataset("datasets/celeba_hq_256", split='train')
+        elif os.path.isdir(name):
+            # generated dataset
+            return load_dataset('imagefolder', data_dir=name)['train']
         else:
             raise NotImplementedError(f"Undefined dataset: {name}")
             
@@ -96,7 +99,7 @@ class DatasetLoader(object):
         if self.__name == self.MNIST:
             self.__channel = 1 if self.__channel == None else self.__channel
             self.__cmap = "gray"
-        elif self.__name == self.CIFAR10 or self.__name == self.CELEBA or self.__name == self.CELEBA_HQ or self.__name == self.LSUN_CHURCH:
+        elif self.__name == self.CIFAR10 or self.__name == self.CELEBA or self.__name == self.CELEBA_HQ or self.__name == self.LSUN_CHURCH or self.CIFAR10 in self.__name:
             self.__channel = 3 if self.__channel == None else self.__channel
             self.__cmap = None
         else:
@@ -112,6 +115,9 @@ class DatasetLoader(object):
                 self.__image_size = 64
             elif self.__name == self.CELEBA_HQ or self.__name == self.LSUN_CHURCH:
                 self.__image_size = 256
+            elif self.CIFAR10 in self.__name:
+                # generated dataset
+                self.__image_size = 32
             else:
                 raise NotImplementedError(f"No dataset named as {self.__name}")
         else:
@@ -229,25 +235,31 @@ class DatasetLoader(object):
         ds_n = len(self.__dataset)
         train_n = int(ds_n * float(self.__clean_rate))
         test_n = int(ds_n * float(self.__poison_rate))
-        
-        # Apply transformations
-        self.__full_dataset: datasets.DatasetDict = self.__dataset.train_test_split(train_size=train_n, test_size=test_n)
-        self.__full_dataset[DatasetLoader.TRAIN] = self.__full_dataset[DatasetLoader.TRAIN].add_column(DatasetLoader.IS_CLEAN, [True] * train_n)
-        self.__full_dataset[DatasetLoader.TEST] = self.__full_dataset[DatasetLoader.TEST].add_column(DatasetLoader.IS_CLEAN, [False] * test_n)
-        
+
         def trans(x):
             if x[DatasetLoader.IS_CLEAN][0]:
                 return self.__transform_generator(self.__name, True)(x)
             return self.__transform_generator(self.__name, False)(x)
-        
-        self.__full_dataset = concatenate_datasets([self.__full_dataset[DatasetLoader.TRAIN], self.__full_dataset[DatasetLoader.TEST]])
+
+        if test_n == 0:
+            # Apply transformations
+            self.__full_dataset: datasets.DatasetDict = self.__dataset.train_test_split(train_size=train_n)
+            self.__full_dataset = self.__full_dataset[DatasetLoader.TRAIN].add_column(DatasetLoader.IS_CLEAN, [True] * train_n)
+        else:
+            # Apply transformations
+            self.__full_dataset: datasets.DatasetDict = self.__dataset.train_test_split(train_size=train_n, test_size=test_n)
+            self.__full_dataset[DatasetLoader.TRAIN] = self.__full_dataset[DatasetLoader.TRAIN].add_column(DatasetLoader.IS_CLEAN, [True] * train_n)
+            self.__full_dataset[DatasetLoader.TEST] = self.__full_dataset[DatasetLoader.TEST].add_column(DatasetLoader.IS_CLEAN, [False] * test_n)
+
+
+            self.__full_dataset = concatenate_datasets([self.__full_dataset[DatasetLoader.TRAIN], self.__full_dataset[DatasetLoader.TEST]])
         self.__full_dataset = self.__full_dataset.with_transform(trans)
-    
+
     def prepare_dataset(self, mode: str="FIXED") -> 'DatasetLoader':
         # Filter specified classes
         if self.__label != None:
             self.__dataset = self.__dataset.filter(lambda x: x[DatasetLoader.LABEL] in self.__label)
-        
+
         if mode == DatasetLoader.MODE_FIXED:
             if self.__clean_rate != 1.0 or self.__clean_rate != None:
                 Log.warning("In 'FIXED' mode of DatasetLoader, the clean_rate will be ignored whatever.")
@@ -256,7 +268,7 @@ class DatasetLoader(object):
             self.__flex_sz_dataset()
         else:
             raise NotImplementedError(f"Argument mode: {mode} isn't defined")
-        
+
         # Note the minimum and the maximum values
         ex = self.__full_dataset[1][DatasetLoader.TARGET]
         if len(ex) == 1:
@@ -280,6 +292,10 @@ class DatasetLoader(object):
             img_key = "image"
         elif dataset_name == self.CIFAR10:
             img_key = "img"
+        elif self.CIFAR10 in self.__name:
+            # generated dataset
+            img_key = 'image'
+
         if dataset_name == self.CELEBA:
             img_key = "image"
         if dataset_name == self.CELEBA_HQ:
@@ -297,11 +313,8 @@ class DatasetLoader(object):
                 
             examples[DatasetLoader.PIXEL_VALUES] = torch.full_like(examples[DatasetLoader.IMAGE], 0)
             examples[DatasetLoader.TARGET] = torch.clone(examples[DatasetLoader.IMAGE])
-            if DatasetLoader.LABEL in examples:
+            if self.__label:
                 examples[DatasetLoader.LABEL] = torch.tensor([torch.tensor(x, dtype=torch.float) for x in examples[DatasetLoader.LABEL]])
-            else:
-                examples[DatasetLoader.LABEL] = torch.tensor([torch.tensor(-1, dtype=torch.float) for i in range(len(examples[DatasetLoader.PIXEL_VALUES]))])
-                
             return examples
         def backdoor_transforms(examples) -> DatasetDict:
             examples = clean_transforms(examples)
@@ -312,6 +325,7 @@ class DatasetLoader(object):
             masks = self.get_mask(self.__trigger).repeat(*repeat_times)
             examples[DatasetLoader.PIXEL_VALUES] = masks * examples[DatasetLoader.IMAGE] + (1 - masks) * self.__trigger.repeat(*repeat_times)
             examples[DatasetLoader.TARGET] = self.__target.repeat(*repeat_times)
+
             return examples
         
         if clean:

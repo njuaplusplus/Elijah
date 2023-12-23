@@ -295,6 +295,7 @@ def p_losses_diffuser(noise_sched, model: nn.Module, x_start: torch.Tensor, R: t
     #     x_noisy = torch.clamp(x_noisy, min=DEFAULT_VMIN, max=DEFAULT_VMAX)
     predicted_noise = model(x_noisy.contiguous(), timesteps.contiguous(), return_dict=False)[0]
 
+
     if loss_type == 'l1':
         loss = F.l1_loss(target, predicted_noise)
     elif loss_type == 'l2':

@@ -1,4 +1,7 @@
 # BadDiffusion
+
+**NOTE: Please set up the environment accordingly. Details of backdoor removal are at the end.**
+
 Official repo to reproduce the paper "How to Backdoor Diffusion Models?" published at CVPR 2023
 
 Paper link: https://arxiv.org/abs/2212.05400
@@ -69,19 +72,10 @@ Or simply generate the samples
 python baddiffusion.py --project default --mode sampling --ckpt res_DDPM-CIFAR10-32_CIFAR10_ep50_c1.0_p0.1_BOX_14-HAT --fclip o --gpu 0
 ```
 
-### Run Adversarial Neuron Pruning (ANP)
+## Backdoor Removal
 
-Arguments
-- ``--project``: Project name for Wandb
-- ``--epoch``: Training epoch num, default: 50
-- ``--learning_rate``: Learning rate, default: '1e-4'
-- ``--perturb_budget``: Perturbation budget, default: '4.0'
-- ``--gpu``: Specify GPU device
-- ``--ckpt``: Load the HuggingFace Diffusers pre-trained models or the saved checkpoint
-- ``--output_dir``: Output file path, default: '.'
-
-If we want to detect the Trojan of the backdoored model trained in the last section, we can use the following command
+We can use the following script to backdoor a model, invert the trigger and remove the backdoor.
 
 ```bash
-python anp_defense.py --project default --epoch 5 --learning_rate 1e-4 --perturb_budget 4.0 --ckpt res_DDPM-CIFAR10-32_CIFAR10_ep50_c1.0_p0.1_BOX_14-HAT --gpu 0
+bash run_example.sh
 ```

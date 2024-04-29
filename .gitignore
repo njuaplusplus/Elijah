@@ -13,6 +13,7 @@ __pycache__
 !*.sh
 !README.md
 !BadDiffusion
+!VillanDiffusion
 
 tmp/
 *.pth

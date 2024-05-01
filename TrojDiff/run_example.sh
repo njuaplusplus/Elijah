@@ -8,7 +8,7 @@ export CUDA_VISIBLE_DEVICES=0
 python main_attack_d2i.py --dataset cifar10 --config cifar10_100k.yml --target_label 7 --ni --resume_training --target_label 7 --gamma 0.1 --trigger_type patch --miu_path "./images/${miu_path}.png" --target_path "./images/${target_path}.png" --patch_size 3 --max_steps 100000
 
 # invert trigger
-python my_trigger_inversion.py --dataset cifar10 --config cifar10_no_ema.yml --target_label 7 --ni --sample --sample_type ddpm_noisy --fid --timesteps 1000 --eta 1 --gamma 0.1 --trigger_type patch --miu_path "./images/${miu_path}.png" --target_path "./images/${target_path}.png" --patch_size 3
+python elijah_helper.py --dataset cifar10 --config cifar10_no_ema.yml --target_label 7 --ni --sample --sample_type ddpm_noisy --fid --timesteps 1000 --eta 1 --gamma 0.1 --trigger_type patch --miu_path "./images/${miu_path}.png" --target_path "./images/${target_path}.png" --patch_size 3
 
 # backdoor removal
 python main_attack_d2i.py --dataset cifar10 --config cifar10_no_ema.yml --target_label 7 --ni --resume_training --target_label 7 --gamma 0.1 --trigger_type patch --miu_path "./images/${miu_path}.png" --target_path "./images/${target_path}.png" --patch_size 3 --remove_backdoor --subset_ratio 0.1  --max_steps=20000
